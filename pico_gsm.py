@@ -3,9 +3,9 @@ import os
 import utime
 import binascii
 import _thread
+import sys
 
- #uart lock added so that detecting calls and sms functions could work at the same time - maybe there's an easier way to do this
-
+from collections import deque
 
 
 # using pin defined
@@ -21,6 +21,7 @@ temperature = 0
 
 # uart setting
 uart = machine.UART(uart_port, uart_baute)
+buffer = deque([], 1000)
 
 uart_lock = _thread.allocate_lock()
 
@@ -69,7 +70,7 @@ class Modem:
             
             self.uart.write(f"AT+CMGR={sms_index}\r\n".encode())
             utime.sleep(0.5)
-            return self.uart.read().decode('ignore')f
+            return self.uart.read().decode('ignore')
         
     def read_contact(self, i):
         """
@@ -216,8 +217,7 @@ def check_start():
             power_on_off()
             print("[INFO] Restarting SIM868...")
             utime.sleep(8)
-    print("[ERROR] SIM868 failed to start.")
-    return False
+    raise ValueError("[ERROR] SIM868 failed to start.")
 
 
 def check_gsm():
@@ -256,27 +256,47 @@ def check_gsm():
     print("\n--- GSM & GPRS MODULE READY ---")
     return True
 
-def monitor_incoming_calls():
-    print("\n--- STARTING INCOMING CALL MONITOR ---")
+def init_device():
+    if check_start():
+        if check_gsm():
+            send_at("AT+CLIP=1", "OK")  # Enable caller ID
+            send_at("AT+CMGF=1", "OK")  # Set SMS system into text mode
+            utime.sleep(0.5)
+            
+        else:
+            print("[ERROR] GSM setup failed.")
+            sys.exit()
+    else:
+        print("[ERROR] SIM module failed to start.")
+        sys.exit()
 
-    send_at("AT+CLIP=1", "OK")  # Enable caller ID
+def read_uart_message():
+    return modem.uart_read()
 
-    call_active = False
-    ring_start_time = 0
-    caller_number = ""
-    caller_name = ""
+def event_listener():
+    print("\n--- STARTING EVENT LISTENER ---")
 
     while True:
         utime.sleep(0.5)
-        response = modem.uart_read()
+        response = read_uart_message()
+        print(f"Uart message: {response}")
+        if response:
+            buffer.append(response)
+        utime.sleep(0.5)
         
-        print(f"Incomming call: read UART: {response}")
-        if "RING" in response:
-            if not call_active:
-                print("\n[INFO] Incoming call detected.")
-                call_active = True
-                ring_start_time = utime.ticks_ms()
+        
+def event_handler():
+    while True:
+        if len(buffer) == 0:
+            continue
+            utime.sleep(0.1)
+        response = buffer.popleft()
+        handle_uart_message(response)
 
+def handle_uart_message(response):
+    if "RING" in response: # New call has been detected
+        print("\n[INFO] Incoming call detected.")
+        
         # Checks if the number is saved or not
         if "+CLIP:" in response: # If enabled +CLIP notification
             try:
@@ -297,143 +317,21 @@ def monitor_incoming_calls():
                     
                     # Opens the gate
                     
-                    call_active = False
-                    ring_start_time = 0
                     caller_number = ""
                     caller_name = ""
-                    continue  
                 else:
                     print("[WARNING] Unknown number. Hanging up.")
                     modem.hang_up()
                     
-                    call_active = False
-                    ring_start_time = 0
                     caller_number = ""
-                    caller_name = ""
-                    continue  
+                    caller_name = "" 
 
             except Exception as e:
                 print("[ERROR] Failed to parse CLIP:", e)
-
-        if call_active:
-            print("RINGING...")
-            if utime.ticks_diff(utime.ticks_ms(), ring_start_time) > 5:
-                print("[INFO] Hanging up the call.")
-                modem.hang_up()
+        else:
+            print("[ERROR] +CLIP notification not enabled.")
                 
-                call_active = False
-                ring_start_time = 0
-                caller_number = ""
-                caller_name = ""
-        else:
-            utime.sleep(3)
-            print("[CHECK] No call... checking again.")        
-
-def add_contact(number):
-    if is_number_in_sim(number):
-        print(f"[INFO] Number already saved.")
-    else:
-        name = "user"
-
-        number_type = 145 if number.startswith('+') else 129
-    
-        command = f'AT+CPBW=1,"{number}",{number_type},"{name}"'
-        print(f"\nSending: {command}")
-        if send_at(command, "OK"):
-            print(f"[OK] Contact '{name}' with number '{number}' saved to SIM.")
-        else:
-            print(f"[ERROR] Failed to save contact.")
-        
-def delete_contact(number_to_delete):
-
-    response = modem.get_contact_range()
-    
-    try:
-        start = response.index('(') + 1
-        end = response.index(')')
-        index_range = response[start:end]
-        min_idx, max_idx = [int(x) for x in index_range.split('-')]
-
-    except:
-        print("[ERROR] Failed to parse index range")
-        return
-    
-    for i in range(min_idx, max_idx + 1):
-        entry = modem.read_contact(i)
-        if number_to_delete in entry:
-            print(f"[INFO] Found number at index {i}, deleting...")
-            uart.write(f'AT+CPBW={i}\r\n'.encode())  # delete
-            utime.sleep(0.2)
-            print(f"[OK] Contact with number {number_to_delete} deleted.")
-            return
-
-    print(f"[INFO] Number {number_to_delete} not found in SIM contacts.")
-
-def is_number_in_sim(contact_number):
-    resp = modem.get_contact_range()
-
-    try:
-        start = resp.index('(') + 1
-        end = resp.index(')')
-        index_range = resp[start:end]
-        min_idx, max_idx = [int(x) for x in index_range.split('-')]
-
-        for i in range(min_idx, max_idx + 1):
-            entry = modem.read_contact(i)
-
-            if "+CPBR:" in entry: # If number in phonebook
-                try:
-                    parts = entry.split(',')
-                    sim_number = parts[1].strip().strip('"')
-                    name = parts[3].strip().strip('"')
-
-                    if sim_number == contact_number:
-                        return sim_number
-                except:
-                    pass
-        return None
-
-    except Exception as e:
-        print("[ERROR] Could not read SIM contacts:", e)
-        return None
-    
-def get_name_from_sim(number):
-    
-    send_at("AT+CPBR=1,100", "OK")  # Reads phonebook
-    utime.sleep(0.5)
-
-    response = modem.uart_read()
-    
-    for line in response.splitlines():
-        if number in line:
-            parts = line.split(",")
-            if len(parts) >= 4:
-                name = parts[3].strip().strip('"')
-                return name
-    return "Unknown"
-        
-def check_for_call():
-    if check_start():
-        if check_gsm():
-            monitor_incoming_calls()
-        else:
-            print("[ERROR] GSM setup failed. Incoming call monitor not started.")
-    else:
-        print("[ERROR] SIM module failed to start.")
-   
-
-
-def read_sms():
-    send_at("AT+CMGF=1", "OK")  # Set SMS system into text mode
-    utime.sleep(0.3)
-
-    while True:
-        utime.sleep(1)
-        response = modem.uart_read()
-        
-        print(f"SMS uart: {response}")
-        
-        if "+CMTI:" in response: # Indicates that new message has been received
+    elif "+CMTI:" in response: # New message has been received
             try:
                 print("\n[INFO] New SMS received.")
                 
@@ -485,29 +383,176 @@ def read_sms():
                 
             except Exception as e:
                 print("[ERROR] Failed to parse SMS:", e)
+                
+    else:
+        print(f"Response unknown: {response}")
+
+def clean_number(number):
+    if number.startswith("+48"):
+        number = number[3:]
+    return number
+
+def is_number_valid(number):
+    number = clean_number(number)
+    return number.isdigit() and len(number) == 9
+    
+
+def add_contact(number):
+    if not is_number_valid(number):
+        print("[INFO] Invalid number.")
+        resp = 4
+        return resp
+    if is_number_in_sim(number):
+        print(f"[INFO] Number already saved.")
+        resp = 1
+        return resp
+    else:
+        name = ""
+
+        number_type = 145 if number.startswith('+') else 129
+    
+        command = f'AT+CPBW=1,"{number}",{number_type},"{name}"'
+        print(f"\nSending: {command}")
+        if send_at(command, "OK"):
+            print(f"[OK] Contact '{name}' with number '{number}' saved to SIM.")
+            resp = 2
+            return resp
         else:
-            utime.sleep(2)
+            print(f"[ERROR] Failed to save contact.")
+            resp = 3
+            return resp
+        
+def delete_contact(number_to_delete):
+    if not is_number_valid(number_to_delete):
+        print("[INFO] Invalid number.")
+        resp = 3
+        return resp
+    
+    response = modem.get_contact_range()
+    
+    try:
+        start = response.index('(') + 1
+        end = response.index(')')
+        index_range = response[start:end]
+        min_idx, max_idx = [int(x) for x in index_range.split('-')]
+
+    except:
+        print("[ERROR] Failed to parse index range")
+        return
+    
+    for i in range(min_idx, max_idx + 1):
+        entry = modem.read_contact(i)
+        if number_to_delete in entry:
+            print(f"[INFO] Found number at index {i}, deleting...")
+            uart.write(f'AT+CPBW={i}\r\n'.encode())  # delete
+            utime.sleep(0.2)
+            print(f"[OK] Contact with number {number_to_delete} deleted.")
+            resp = 1
+            return resp
+
+    print(f"[INFO] Number {number_to_delete} not found in SIM contacts.")
+    resp = 2
+    return resp
+
+def is_number_in_sim(contact_number):
+    resp = modem.get_contact_range()
+
+    try:
+        start = resp.index('(') + 1
+        end = resp.index(')')
+        index_range = resp[start:end]
+        min_idx, max_idx = [int(x) for x in index_range.split('-')]
+
+        for i in range(min_idx, max_idx + 1):
+            entry = modem.read_contact(i)
+
+            if "+CPBR:" in entry: # If number in phonebook
+                try:
+                    parts = entry.split(',')
+                    sim_number = parts[1].strip().strip('"')
+                    name = parts[3].strip().strip('"')
+
+                    if sim_number == contact_number:
+                        return sim_number
+                except:
+                    pass
+        return None
+
+    except Exception as e:
+        print("[ERROR] Could not read SIM contacts:", e)
+        return None
+    
+def get_name_from_sim(number):
+    
+    send_at("AT+CPBR=1,100", "OK")  # Reads phonebook
+    utime.sleep(0.5)
+
+    response = modem.uart_read()
+    
+    for line in response.splitlines():
+        if number in line:
+            parts = line.split(",")
+            if len(parts) >= 4:
+                name = parts[3].strip().strip('"')
+                return name
+    return "Unknown"
+
            
 def sms_command(text): 
 
     if text.startswith("+"):
         number = text[1:].strip().split()[0]
-        add_contact(number)
-        print(f"[OK] Added number: {number}")
-        message = f"Number {number} added to SIM card."
-        return message
+        resp = add_contact(number)
+        if resp == 1:
+            print(f"[INFO] Number {number} already saved.")
+            message = f"Number {number} already saved."
+            return message
+        elif resp == 2:
+            print(f"[OK] Added number: {number}")
+            message = f"Number {number} added to SIM card."
+            return message
+        elif resp == 3:
+            print(f"[INFO] Failed to save the number {number}")
+            message = f"Failed to save the number {number}"
+            return message
+        elif resp == 4:
+            print(f"[INFO] Invalid number {number}")
+            message = f"Number {number} is not valid."
+            return message
+        else:
+            print(f"[INFO] Failed to save the number {number}")
+            message = f"Failed to save the number {number}"
+            return message
         
     elif text.startswith("-"):
         number = text[1:].strip().split()[0]
-        delete_contact(number)
-        print(f"[OK] Deleted number: {number}")
-        message = f"Number {number} deleted from SIM card."
-        return message
+        resp = delete_contact(number)
+        if resp == 1:
+            print(f"[OK] Deleted number: {number}")
+            message = f"Number {number} deleted from SIM card."
+            return message
+        elif resp == 2:
+            print (f"[INFO] Number {number} not found in SIM contacts.")
+            message = f"Number {number} not found in SIM contacts."
+            return message
+        elif resp == 3:
+            print(f"[INFO] Invalid {number}.")
+            message = f"Number {number} is not valid."
+            return message
+        else:
+            print (f"[ERROR] Failed to delete number {number}.")
+            message = f"Failed to delete number {number}."
+            return message
+            
         
     elif text.startswith("?"):
         number = text[1:].strip().split()[0]
         is_number_in_sim(number)
-        if is_number_in_sim(number):
+        if not is_number_valid(number):
+            print("[INFO] Invalid number.")
+            message = f"Number {number} is not valid."
+            return message
+        elif is_number_in_sim(number):
             print(f"[INFO] Number {number} is in SIM card.")
             message = f"Number {number} is in SIM card."
             return message
@@ -558,15 +603,21 @@ def send_sms(number, message):
 
 
 # --------------------------------------------  MAIN  ----------------------------------------------
+def main():
+    try:
+        init_device()
+        
+        # Thread #2
+        _thread.start_new_thread(event_listener, ())
 
-# Thread #2: monitoring SMS
-_thread.start_new_thread(read_sms, ())
+        # Main thread
+        event_handler()
+    except Exception as e:
+        print(e)
+        raise e
+    finally:
+        # byc moze jakies czyszczenie urzadzenia, jezeli jest potrzebne
+        pass
 
-# Run call monitor in main thread
-check_for_call()
+main()
 
-#send_at("AT+CPMS?", "OK")
-#send_at("AT+CMGD=1,4", "OK")
-#modem.delete_sms(4)
-#send_at("AT+CMGF=1", "OK")
-#send_at('AT+CMGL="ALL"', "OK")
